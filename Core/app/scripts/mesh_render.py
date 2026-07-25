@@ -9,7 +9,7 @@ import trimesh
 import imageio
 
 # ------------------------------------------------------------
-# Configuration persistence
+# Configuration
 # ------------------------------------------------------------
 CONFIG_FILE = "orbital_anim_config.json"
 DEFAULT_CONFIG = {
@@ -17,8 +17,8 @@ DEFAULT_CONFIG = {
     "output_path": "",
     "width": 800,
     "height": 600,
-    "total_frames": 120,
-    "orbit_speed": 360,
+    "hold_frames": 60,            # frames per shot
+    "transition_frames": 40,      # frames between shots
     "model_color": [179, 179, 179],
 }
 
@@ -26,7 +26,6 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             cfg = json.load(f)
-        # Ensure all expected keys exist
         for key, val in DEFAULT_CONFIG.items():
             if key not in cfg:
                 cfg[key] = val
@@ -38,7 +37,7 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 # ------------------------------------------------------------
-# Model loading (unchanged)
+# Model loading
 # ------------------------------------------------------------
 def load_model(filepath):
     try:
@@ -71,7 +70,7 @@ def load_model(filepath):
     return mesh
 
 # ------------------------------------------------------------
-# Software rasterizer (accepts a base color)
+# Software rasterizer (with increased near plane)
 # ------------------------------------------------------------
 class SoftwareRenderer:
     def __init__(self, width, height, base_color_rgb, fov=np.pi/3,
@@ -82,7 +81,8 @@ class SoftwareRenderer:
         self.light_dir = light_dir / np.linalg.norm(light_dir)
         self.base_color = np.array(base_color_rgb, dtype=np.uint8)
         aspect = width / height
-        self.proj = self._perspective_projection(fov, aspect, near=0.1, far=100.0)
+        # *** INCREASED NEAR PLANE TO 0.5 ***
+        self.proj = self._perspective_projection(fov, aspect, near=0.5, far=100.0)
 
     @staticmethod
     def _perspective_projection(fov, aspect, near, far):
@@ -95,7 +95,6 @@ class SoftwareRenderer:
         ], dtype=np.float32)
 
     def render(self, vertices, faces, camera_pos, camera_target=np.array([0,0,0])):
-        # View matrix
         z_axis = camera_pos - camera_target
         z_axis = z_axis / np.linalg.norm(z_axis)
         x_axis = np.cross(np.array([0,1,0]), z_axis)
@@ -193,39 +192,78 @@ class SoftwareRenderer:
         return image
 
 # ------------------------------------------------------------
-# Animation generation
+# 32 creative close‑up shots (no clipping)
 # ------------------------------------------------------------
 def generate_animation(settings, progress_callback, done_callback):
     try:
         mesh = load_model(settings["input_path"])
         vertices = mesh.vertices.copy()
-        vertices -= vertices.mean(axis=0)
-        scale = 1.0 / np.max(np.linalg.norm(vertices, axis=1))
-        vertices *= scale * 1.5
+        centroid = vertices.mean(axis=0)
+        vertices -= centroid
+        max_dist = np.max(np.linalg.norm(vertices, axis=1))
+        vertices /= max_dist
+        vertices *= 1.2
 
         w, h = settings["width"], settings["height"]
         base_color = settings.get("model_color", [179,179,179])
         renderer = SoftwareRenderer(w, h, base_color)
 
-        total = settings["total_frames"]
-        angle_step = settings["orbit_speed"] / total
+        # 32 dynamic camera positions (x,y,z) around the car
+        camera_sequence = [
+            (0.0, 0.15, 1.6), (0.2, 0.0, 1.8), (-0.3, 0.3, 1.5), (0.3, 0.3, 1.5),
+            (0.9, 0.3, 1.0), (0.8, 0.5, 1.1), (-0.9, 0.3, 1.0), (-0.8, 0.5, 1.1),
+            (1.6, 0.3, 0.4), (1.5, 0.6, 0.3), (1.7, 0.1, 0.5), (1.4, 0.4, 0.8),
+            (0.8, 0.4, -1.2), (0.7, 0.5, -1.3), (-0.8, 0.4, -1.2), (-0.7, 0.5, -1.3),
+            (0.0, 0.15, -1.6), (-0.2, 0.3, -1.5), (0.2, 0.3, -1.5), (0.0, 0.5, -1.4),
+            (0.0, 2.0, 0.0), (0.6, 1.8, 0.4), (-0.5, 1.8, 0.4), (0.0, 1.8, -0.6),
+            (0.7, 0.05, 1.3), (-0.7, 0.05, 1.3), (0.7, 0.05, -1.1), (-0.7, 0.05, -1.1),
+            (0.4, -0.2, 1.2), (1.0, -0.2, 0.3), (-0.4, -0.2, -1.2), (0.0, -0.2, 0.0),
+        ]
+        
+        # Minimum safe distance from origin to avoid clipping into the model
+        safe_distance = 1.5
+        # Enforce safe distance on all predefined shots
+        camera_sequence = [
+            tuple(np.array(pos) * (safe_distance / np.linalg.norm(pos))
+                  if np.linalg.norm(pos) < safe_distance else pos)
+            for pos in camera_sequence
+        ]
+        
+        num_shots = len(camera_sequence)   # 32
+        hold = settings["hold_frames"]
+        trans = settings["transition_frames"]
+        total_frames = num_shots * hold + num_shots * trans
+
+        def ease_in_out(t):
+            return t * t * (3.0 - 2.0 * t)
+
         frames = []
+        frame_idx = 0
 
-        distance = 2.5
-        elevation = 0.5
+        for i in range(num_shots):
+            cam_pos = np.array(camera_sequence[i], dtype=np.float32)
+            for _ in range(hold):
+                frame = renderer.render(vertices, mesh.faces, cam_pos)
+                frames.append(frame)
+                frame_idx += 1
+                progress_callback(int(frame_idx / total_frames * 100))
 
-        for i in range(total):
-            azimuth = np.deg2rad(i * angle_step)
-            cam_x = distance * np.cos(azimuth)
-            cam_y = elevation * distance
-            cam_z = distance * np.sin(azimuth)
-            camera_pos = np.array([cam_x, cam_y, cam_z])
+            next_i = (i + 1) % num_shots
+            start_pos = np.array(camera_sequence[i], dtype=np.float32)
+            end_pos = np.array(camera_sequence[next_i], dtype=np.float32)
 
-            frame = renderer.render(vertices, mesh.faces, camera_pos)
-            frames.append(frame)
-
-            percent = int((i+1)/total*100)
-            progress_callback(percent)
+            for t in range(1, trans + 1):
+                t_norm = t / trans
+                t_eased = ease_in_out(t_norm)
+                interp_pos = start_pos + (end_pos - start_pos) * t_eased
+                # Ensure interpolated camera also stays outside safe zone
+                dist = np.linalg.norm(interp_pos)
+                if dist < safe_distance:
+                    interp_pos = interp_pos * (safe_distance / dist)
+                frame = renderer.render(vertices, mesh.faces, interp_pos.astype(np.float32))
+                frames.append(frame)
+                frame_idx += 1
+                progress_callback(int(frame_idx / total_frames * 100))
 
         writer = imageio.get_writer(
             settings["output_path"], format='FFMPEG', mode='I', fps=30,
@@ -244,12 +282,12 @@ def generate_animation(settings, progress_callback, done_callback):
         done_callback(False, err)
 
 # ------------------------------------------------------------
-# Dark‑mode GUI (with color picker)
+# GUI
 # ------------------------------------------------------------
 class OrbitalAnimatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("3D Model Orbital Animation (WebM) – Software Renderer")
+        self.root.title("Hotrod Hologram – 32 Creative Shots (No Clipping)")
         self.root.configure(bg='#2b2b2b')
         self.config = load_config()
         self._create_widgets()
@@ -269,13 +307,13 @@ class OrbitalAnimatorApp:
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Row 0: Input file
+        # Row 0: Input
         ttk.Label(main_frame, text="Input Model (STL/3MF):").grid(row=0, column=0, sticky='w', pady=2)
         self.input_var = tk.StringVar(value=self.config["input_path"])
         ttk.Entry(main_frame, textvariable=self.input_var, width=50).grid(row=0, column=1, sticky='we', padx=5)
         ttk.Button(main_frame, text="Browse", command=self._browse_input).grid(row=0, column=2, padx=2)
 
-        # Row 1: Output file
+        # Row 1: Output
         ttk.Label(main_frame, text="Output WebM:").grid(row=1, column=0, sticky='w', pady=2)
         self.output_var = tk.StringVar(value=self.config["output_path"])
         ttk.Entry(main_frame, textvariable=self.output_var, width=50).grid(row=1, column=1, sticky='we', padx=5)
@@ -289,43 +327,45 @@ class OrbitalAnimatorApp:
         self.height_var = tk.IntVar(value=self.config["height"])
         ttk.Spinbox(main_frame, from_=240, to=2160, textvariable=self.height_var, width=8).grid(row=2, column=1, sticky='e', padx=5)
 
-        # Row 3: Animation settings
-        ttk.Label(main_frame, text="Total Frames:").grid(row=3, column=0, sticky='e', pady=2)
-        self.frames_var = tk.IntVar(value=self.config["total_frames"])
-        ttk.Spinbox(main_frame, from_=10, to=1000, textvariable=self.frames_var, width=8).grid(row=3, column=1, sticky='w', padx=5)
+        # Row 3: Timing
+        ttk.Label(main_frame, text="Hold Frames per Shot:").grid(row=3, column=0, sticky='e', pady=2)
+        self.hold_var = tk.IntVar(value=self.config["hold_frames"])
+        ttk.Spinbox(main_frame, from_=10, to=300, textvariable=self.hold_var, width=8).grid(row=3, column=1, sticky='w', padx=5)
 
-        ttk.Label(main_frame, text="Orbit Speed (deg):").grid(row=3, column=1, sticky='e', padx=60)
-        self.speed_var = tk.DoubleVar(value=self.config["orbit_speed"])
-        ttk.Spinbox(main_frame, from_=10, to=3600, textvariable=self.speed_var, width=8).grid(row=3, column=1, sticky='e', padx=5)
+        ttk.Label(main_frame, text="Transition Frames:").grid(row=3, column=1, sticky='e', padx=100)
+        self.trans_var = tk.IntVar(value=self.config["transition_frames"])
+        ttk.Spinbox(main_frame, from_=10, to=300, textvariable=self.trans_var, width=8).grid(row=3, column=1, sticky='e', padx=5)
 
-        # Row 4: Model color picker
+        # Row 4: Model color
         ttk.Label(main_frame, text="Model Color:").grid(row=4, column=0, sticky='e', pady=5)
-
-        model_color = self.config.get("model_color", [179, 179, 179])   # safe fallback
+        model_color = self.config.get("model_color", [179, 179, 179])
         self.color_btn = tk.Button(
             main_frame, text="", bg=self._rgb_to_hex(model_color),
             activebackground=self._rgb_to_hex(model_color),
             command=self._pick_color, relief=tk.FLAT, width=4, height=1, borderwidth=1
         )
         self.color_btn.grid(row=4, column=1, sticky='w', padx=5)
-        self.color_label = ttk.Label(
-            main_frame,
-            text=self._rgb_to_text(model_color),
-            foreground='#aaaaaa'
-        )
+        self.color_label = ttk.Label(main_frame, text=self._rgb_to_text(model_color), foreground='#aaaaaa')
         self.color_label.grid(row=4, column=1, sticky='e', padx=120)
 
-        # Row 5: Generate button
+        # Row 5: Total frames info
+        self.total_label = ttk.Label(main_frame, text="Total Frames: --", foreground='#aaaaaa')
+        self.total_label.grid(row=5, column=0, columnspan=3, pady=2)
+        self._update_total_label()
+        self.hold_var.trace_add("write", lambda *a: self._update_total_label())
+        self.trans_var.trace_add("write", lambda *a: self._update_total_label())
+
+        # Row 6: Generate
         self.generate_btn = ttk.Button(main_frame, text="Generate WebM", command=self._start_generation)
-        self.generate_btn.grid(row=5, column=0, columnspan=3, pady=10)
+        self.generate_btn.grid(row=6, column=0, columnspan=3, pady=10)
 
-        # Row 6: Progress bar
+        # Row 7: Progress
         self.progress = ttk.Progressbar(main_frame, orient='horizontal', length=400, mode='determinate')
-        self.progress.grid(row=6, column=0, columnspan=3, pady=5, sticky='we')
+        self.progress.grid(row=7, column=0, columnspan=3, pady=5, sticky='we')
 
-        # Row 7: Status
+        # Row 8: Status
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(main_frame, textvariable=self.status_var, foreground='#aaaaaa').grid(row=7, column=0, columnspan=3)
+        ttk.Label(main_frame, textvariable=self.status_var, foreground='#aaaaaa').grid(row=8, column=0, columnspan=3)
 
         main_frame.columnconfigure(1, weight=1)
 
@@ -334,6 +374,16 @@ class OrbitalAnimatorApp:
 
     def _rgb_to_text(self, rgb):
         return f"RGB({rgb[0]}, {rgb[1]}, {rgb[2]})"
+
+    def _update_total_label(self, *args):
+        try:
+            h = self.hold_var.get()
+            t = self.trans_var.get()
+            num_shots = 32
+            total = num_shots * h + num_shots * t
+            self.total_label.config(text=f"Total Frames: {total}  ({num_shots} creative shots)")
+        except:
+            pass
 
     def _pick_color(self):
         color_tuple = colorchooser.askcolor(
@@ -370,14 +420,13 @@ class OrbitalAnimatorApp:
             "output_path": output_path,
             "width": self.width_var.get(),
             "height": self.height_var.get(),
-            "total_frames": self.frames_var.get(),
-            "orbit_speed": self.speed_var.get()
-            # model_color already in config
+            "hold_frames": self.hold_var.get(),
+            "transition_frames": self.trans_var.get(),
         })
         save_config(self.config)
 
         self.generate_btn.configure(state="disabled")
-        self.status_var.set("Rendering (CPU) …")
+        self.status_var.set("Rendering 32 close‑ups …")
         self.progress["value"] = 0
 
         thread = threading.Thread(target=generate_animation,
