@@ -1,3 +1,5 @@
+customtkinter
+moviepy
 trimesh
 pyrender
 imageio
